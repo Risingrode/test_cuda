@@ -1,66 +1,89 @@
-use bech32::{u5, Variant}; // ✅ 移除未用的 FromBase32
 use clap::Parser;
 use glob::glob;
 use rayon::prelude::*;
-use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+
+use bech32::{u5, Variant};
+use base58::FromBase58;
+use ripemd::Ripemd160;
+use sha2::{Digest, Sha256};
 
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(version, about = "Make sorted binary for -i/--in (rmd160 hashes or xpoints).")]
 struct Opts {
+    /// 输入文件通配，逗号分隔（如：'*.txt,parts/*.txt'）；配合 --stdin 可忽略
     #[arg(long, default_value = "*.txt")]
     inputs: String,
+    /// 从标准输入读取（按行/空白分词）
     #[arg(long)]
     stdin: bool,
+    /// 模式：hash160-from-addr | ripemd160-from-hex | xpoint-from-hex
+    #[arg(long, default_value = "hash160-from-addr")]
+    mode: String,
+    /// 输出二进制文件路径（最终结果）。内容为已排序、去重、定长记录
+    #[arg(long)]
+    out: String,
+    /// 每文件并行度（默认=CPU核数）
     #[arg(long)]
     workers: Option<usize>,
-    #[arg(long, default_value = "hash160")]
-    out_prefix: String,
-    #[arg(long)]
-    b58_no_check: bool,
+    /// 从 stdin 读时的块大小（字节）
     #[arg(long, default_value_t = 1024 * 1024)]
     bufsize: usize,
 }
 
-#[derive(Clone, Copy)]
-enum AddrType {
-    P2PKH,
-    P2SH,
-    P2WPKH,
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Hash160FromAddr,   // 20B
+    Ripemd160FromHex,  // 20B
+    XPointFromHex,     // 32B
 }
 
-fn base58check_decode(addr: &str, check: bool) -> Option<Vec<u8>> {
-    let bs = base58::FromBase58::from_base58(addr).ok()?;
-    if bs.is_empty() {
-        return None;
+impl Mode {
+    fn from_str(s: &str) -> io::Result<Self> {
+        match s {
+            "hash160-from-addr" => Ok(Self::Hash160FromAddr),
+            "ripemd160-from-hex" => Ok(Self::Ripemd160FromHex),
+            "xpoint-from-hex" => Ok(Self::XPointFromHex),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "mode must be one of: hash160-from-addr | ripemd160-from-hex | xpoint-from-hex",
+            )),
+        }
     }
-    if !check {
-        return Some(bs);
+    fn rec_len(&self) -> usize {
+        match self {
+            Mode::Hash160FromAddr => 20,
+            Mode::Ripemd160FromHex => 20,
+            Mode::XPointFromHex => 32,
+        }
     }
+}
+
+/* ------------------ 地址解析（hash160） ------------------ */
+fn base58check_decode(addr: &str) -> Option<Vec<u8>> {
+    let bs = addr.from_base58().ok()?;
     if bs.len() < 4 {
         return None;
     }
     let (data, chk) = bs.split_at(bs.len() - 4);
-    let h = Sha256::digest(Sha256::digest(data)).to_vec();
+    let h = Sha256::digest(Sha256::digest(data));
     if h[0..4] != chk[..] {
         return None;
     }
     Some(data.to_vec()) // data = ver(1)+payload(20)
 }
 
-// === convertbits：修复 u5 -> u8 -> u32 ===
-fn convertbits(data: &[u5], frombits: u32, tobits: u32) -> Option<Vec<u8>> {
-    // 严格模式：不 pad
+fn convertbits(data: &[bech32::u5], frombits: u32, tobits: u32) -> Option<Vec<u8>> {
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     let maxv: u32 = (1 << tobits) - 1;
     let mut ret: Vec<u8> = Vec::new();
     for v in data {
-        let v_u32 = v.to_u8() as u32; // ✅ 修复：u5 -> u8 -> u32
+        let v_u32 = v.to_u8() as u32;
         if v_u32 >> frombits != 0 {
             return None;
         }
@@ -77,225 +100,279 @@ fn convertbits(data: &[u5], frombits: u32, tobits: u32) -> Option<Vec<u8>> {
     Some(ret)
 }
 
-fn addr_to_hash160(token: &str, b58_check: bool) -> Option<(AddrType, String)> {
-    if token.is_empty() {
+/// 从比特币地址得到 20B payload（P2PKH/P2SH/P2WPKH）
+fn addr_to_hash160_bytes(addr: &str) -> Option<[u8; 20]> {
+    let b = addr.as_bytes();
+    if b.is_empty() {
         return None;
     }
-    let first = token.as_bytes()[0];
-    if first == b'1' || first == b'3' {
-        let bs = base58check_decode(token, b58_check)?;
-        let (ver, payload) = if b58_check {
-            if bs.len() != 21 {
-                return None;
-            }
-            (bs[0], &bs[1..])
-        } else {
-            if bs.len() < 21 {
-                return None;
-            }
-            (bs[bs.len() - 21], &bs[bs.len() - 20..])
-        };
+    // Base58: 1/3 开头
+    if b[0] == b'1' || b[0] == b'3' {
+        let data = base58check_decode(addr)?;
+        if data.len() != 21 {
+            return None;
+        }
+        let ver = data[0];
+        let payload = &data[1..];
         if payload.len() != 20 {
             return None;
         }
-        return match ver {
-            0x00 => Some((AddrType::P2PKH, hex::encode(payload))), // ✅ 依赖 hex
-            0x05 => Some((AddrType::P2SH, hex::encode(payload))),
-            _ => None,
-        };
-    }
-
-    if token.len() >= 3 && (&token[0..3]).eq_ignore_ascii_case("bc1") {
-        let (hrp, data, variant) = bech32::decode(token).ok()?;
-        if variant != Variant::Bech32 {
-            return None;
+        match ver {
+            0x00 | 0x05 => {
+                let mut out = [0u8; 20];
+                out.copy_from_slice(payload);
+                return Some(out);
+            }
+            _ => return None,
         }
-        if data.is_empty() {
+    }
+    // Bech32: bc1...
+    if addr.len() >= 3 && (&addr[0..3]).eq_ignore_ascii_case("bc1") {
+        let (_hrp, data, variant) = bech32::decode(addr).ok()?;
+        if variant != Variant::Bech32 || data.is_empty() {
             return None;
         }
         let witver = data[0].to_u8();
         let prog = convertbits(&data[1..], 5, 8)?;
         if witver == 0 && prog.len() == 20 {
-            return Some((AddrType::P2WPKH, hex::encode(prog))); // ✅ 依赖 hex
+            let mut out = [0u8; 20];
+            out.copy_from_slice(&prog);
+            return Some(out);
         }
-        return None;
     }
-
     None
 }
 
-fn process_reader<R: Read>(
-    mut rdr: R,
-    out_p2pkh: &mut dyn Write,
-    out_p2sh: &mut dyn Write,
-    out_p2wpkh: &mut dyn Write,
-    b58_check: bool,
-) -> io::Result<(u64, u64, u64, u64)> {
-    let mut buf = String::new();
-    let mut reader = BufReader::new(&mut rdr);
-    let mut c1 = 0u64;
-    let mut c2 = 0u64;
-    let mut c3 = 0u64;
-    let mut skip = 0u64;
+/* ------------------ HEX 输入：RIPEMD160 / XPoint ------------------ */
 
+fn ripemd160_of_hex(s: &str) -> Option<[u8; 20]> {
+    let bytes = hex::decode(s).ok()?;
+    use ripemd::Digest;
+    let mut h = Ripemd160::new();
+    h.update(&bytes);
+    let out = h.finalize();
+    let mut arr = [0u8; 20];
+    arr.copy_from_slice(&out);
+    Some(arr)
+}
+
+/// 从公钥 hex 获取 x 坐标（32B）
+fn xpoint_of_pubkey_hex(s: &str) -> Option<[u8; 32]> {
+    let bytes = hex::decode(s).ok()?;
+    match bytes.first().copied() {
+        Some(0x02) | Some(0x03) => {
+            if bytes.len() != 33 {
+                return None;
+            }
+            let mut x = [0u8; 32];
+            x.copy_from_slice(&bytes[1..33]);
+            Some(x)
+        }
+        Some(0x04) => {
+            if bytes.len() != 65 {
+                return None;
+            }
+            let mut x = [0u8; 32];
+            x.copy_from_slice(&bytes[1..33]); // 0x04 + X(32) + Y(32)
+            Some(x)
+        }
+        _ => None,
+    }
+}
+
+/* ------------------ 输入读取 ------------------ */
+
+fn read_tokens_from_file(path: &Path) -> io::Result<Vec<String>> {
+    let f = File::open(path)?;
+    let mut rdr = BufReader::new(f);
+    let mut buf = String::new();
+    let mut out = Vec::new();
     loop {
         buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        let n = rdr.read_line(&mut buf)?;
         if n == 0 {
             break;
         }
         for tok in buf.split_whitespace() {
-            let b = tok.as_bytes();
-            if b.is_empty() {
-                continue;
+            if !tok.is_empty() {
+                out.push(tok.to_string());
             }
-            let c0 = b[0];
-            if !(c0 == b'1' || c0 == b'3' || c0 == b'b' || c0 == b'B') {
-                continue;
+        }
+    }
+    Ok(out)
+}
+
+fn read_tokens_from_stdin(bufsize: usize) -> io::Result<Vec<String>> {
+    let mut stdin = io::stdin().lock();
+    let mut buf = vec![0u8; bufsize];
+    let mut carry = Vec::<u8>::new();
+    let mut out = Vec::new();
+
+    loop {
+        let n = stdin.read(&mut buf)?;
+        if n == 0 {
+            if !carry.is_empty() {
+                let s = String::from_utf8_lossy(&carry);
+                out.extend(s.split_whitespace().map(|x| x.to_string()));
             }
-            match addr_to_hash160(tok, b58_check) {
-                Some((AddrType::P2PKH, h)) => {
-                    writeln!(out_p2pkh, "{}", h)?;
-                    c1 += 1;
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        let mut last = 0usize;
+        for (i, b) in carry.iter().enumerate() {
+            if *b == b'\n' {
+                let chunk = &carry[last..=i];
+                let s = String::from_utf8_lossy(chunk);
+                out.extend(s.split_whitespace().map(|x| x.to_string()));
+                last = i + 1;
+            }
+        }
+        carry = carry.split_off(last);
+    }
+    Ok(out)
+}
+
+/* ------------------ 单文件处理：产生已排序、去重的临时块 ------------------ */
+fn process_one_file(path: Option<&Path>, mode: Mode, bufsize: usize) -> io::Result<PathBuf> {
+    let tokens = if let Some(p) = path {
+        read_tokens_from_file(p)?
+    } else {
+        read_tokens_from_stdin(bufsize)?
+    };
+
+    let rec_len = mode.rec_len();
+    let mut recs: Vec<Vec<u8>> = Vec::with_capacity(tokens.len());
+
+    for t in tokens {
+        match mode {
+            Mode::Hash160FromAddr => {
+                if let Some(h) = addr_to_hash160_bytes(&t) {
+                    recs.push(h.to_vec());
                 }
-                Some((AddrType::P2SH, h)) => {
-                    writeln!(out_p2sh, "{}", h)?;
-                    c2 += 1;
+            }
+            Mode::Ripemd160FromHex => {
+                if let Some(h) = ripemd160_of_hex(&t) {
+                    recs.push(h.to_vec());
                 }
-                Some((AddrType::P2WPKH, h)) => {
-                    writeln!(out_p2wpkh, "{}", h)?;
-                    c3 += 1;
-                }
-                None => {
-                    skip += 1;
+            }
+            Mode::XPointFromHex => {
+                if let Some(x) = xpoint_of_pubkey_hex(&t) {
+                    recs.push(x.to_vec());
                 }
             }
         }
     }
-    Ok((c1, c2, c3, skip))
+
+    // 排序 + 去重（字节序）
+    recs.sort_unstable();
+    recs.dedup();
+
+    // 写临时块
+    let tmpdir = PathBuf::from("_tmp_mkbin");
+    fs::create_dir_all(&tmpdir)?;
+    let name = match path {
+        Some(p) => format!(
+            "{}.{}.bin",
+            p.file_name().unwrap().to_string_lossy(),
+            rec_len
+        ),
+        None => "STDIN.bin".to_string(),
+    };
+    let outp = tmpdir.join(name);
+    let mut w = BufWriter::new(File::create(&outp)?);
+    for r in recs {
+        w.write_all(&r)?;
+    }
+    w.flush()?;
+    Ok(outp)
 }
 
-fn process_file(path: &Path, tmpdir: &Path, b58_check: bool) -> io::Result<(String, u64, u64, u64, u64, PathBuf, PathBuf, PathBuf)> {
-    let base = path.file_name().unwrap().to_string_lossy().to_string();
-    let p1 = tmpdir.join(format!("{base}.p2pkh.tmp"));
-    let p2 = tmpdir.join(format!("{base}.p2sh.tmp"));
-    let p3 = tmpdir.join(format!("{base}.p2wpkh.tmp"));
+/* ------------------ k 路归并（二进制块） ------------------ */
 
-    let mut o1 = BufWriter::new(File::create(&p1)?);
-    let mut o2 = BufWriter::new(File::create(&p2)?);
-    let mut o3 = BufWriter::new(File::create(&p3)?);
-
-    let f = File::open(path)?;
-    let (c1, c2, c3, skip) = process_reader(f, &mut o1, &mut o2, &mut o3, b58_check)?;
-    o1.flush()?; o2.flush()?; o3.flush()?;
-    Ok((base, c1, c2, c3, skip, p1, p2, p3))
+#[derive(Eq)]
+struct HeapItem {
+    key: Vec<u8>,
+    idx: usize, // 来自哪个输入
+}
+impl Ord for HeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap 是最大堆，我们需要最小堆 => 反向
+        other.key.cmp(&self.key)
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for HeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
 }
 
-fn try_sort_unique(inputs: &[PathBuf], out: &Path) -> io::Result<Option<u64>> {
-    let has_sort = Command::new("bash")
-        .arg("-lc")
-        .arg("command -v sort >/dev/null 2>&1")
-        .status()
-        .ok()
-        .map(|s| s.success())
-        .unwrap_or(false);
+fn kway_merge_sorted_bins(inputs: &[PathBuf], rec_len: usize, out: &Path) -> io::Result<()> {
+    let mut readers: Vec<BufReader<File>> = Vec::new();
+    for p in inputs {
+        readers.push(BufReader::new(File::open(p)?));
+    }
+    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+    let mut buffers: Vec<Vec<u8>> = vec![vec![0u8; rec_len]; readers.len()];
 
-    if !has_sort {
-        let mut outw = BufWriter::new(File::create(out)?);
-        for p in inputs {
-            let mut f = File::open(p)?;
-            io::copy(&mut f, &mut outw)?;
+    // 先从每个块读一条
+    for (i, rdr) in readers.iter_mut().enumerate() {
+        let buf = &mut buffers[i];
+        if rdr.read_exact(buf).is_ok() {
+            heap.push(HeapItem {
+                key: buf.clone(),
+                idx: i,
+            });
         }
-        outw.flush()?;
-        return Ok(None);
     }
 
-    // ✅ 使用 shell-escape 安全拼接路径
-    let list = inputs
-        .iter()
-        .map(|p| shell_escape::escape(p.display().to_string().into()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let out_esc = shell_escape::escape(out.display().to_string().into());
-    let cmd = format!("cat {list} | LC_ALL=C sort -u > {out_esc}");
-    let status = Command::new("bash").arg("-lc").arg(&cmd).status()?;
-    if !status.success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "sort -u failed"));
+    let mut w = BufWriter::new(File::create(out)?);
+    let mut prev: Option<Vec<u8>> = None;
+
+    while let Some(item) = heap.pop() {
+        // 去重：只写与上一条不同的记录
+        if prev.as_ref().map_or(true, |p| p != &item.key) {
+            w.write_all(&item.key)?;
+            prev = Some(item.key.clone());
+        }
+        // 从对应 reader 再读一条
+        let i = item.idx;
+        let buf = &mut buffers[i];
+        if readers[i].read_exact(buf).is_ok() {
+            heap.push(HeapItem {
+                key: buf.clone(),
+                idx: i,
+            });
+        }
     }
-    let count = BufReader::new(File::open(out)?).lines().count() as u64;
-    Ok(Some(count))
+    w.flush()?;
+    Ok(())
 }
+
+/* ------------------ 主流程 ------------------ */
 
 fn main() -> io::Result<()> {
     let opts = Opts::parse();
-
     if let Some(n) = opts.workers {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .ok();
+        rayon::ThreadPoolBuilder::new().num_threads(n).build_global().ok();
     }
 
-    let tmpdir = PathBuf::from("_tmp_hash160");
-    fs::create_dir_all(&tmpdir)?;
+    let mode = Mode::from_str(&opts.mode)?;
+    let rec_len = mode.rec_len();
 
-    let out_p2pkh = PathBuf::from(format!("{}_p2pkh.txt", opts.out_prefix));
-    let out_p2sh = PathBuf::from(format!("{}_p2sh.txt", opts.out_prefix));
-    let out_p2wpkh = PathBuf::from(format!("{}_p2wpkh.txt", opts.out_prefix));
-
-    let mut temp_p2pkh: Vec<PathBuf> = vec![];
-    let mut temp_p2sh: Vec<PathBuf> = vec![];
-    let mut temp_p2wpkh: Vec<PathBuf> = vec![];
-
-    let total = Mutex::new((0u64, 0u64, 0u64, 0u64));
+    // 1) 先生成每个输入的“已排序、去重”临时块
+    let mut chunks: Vec<PathBuf> = Vec::new();
 
     if opts.stdin {
-        let base = "STDIN".to_string();
-        let p1 = tmpdir.join("STDIN.p2pkh.tmp");
-        let p2 = tmpdir.join("STDIN.p2sh.tmp");
-        let p3 = tmpdir.join("STDIN.p2wpkh.tmp");
-        let mut o1 = BufWriter::new(File::create(&p1)?);
-        let mut o2 = BufWriter::new(File::create(&p2)?);
-        let mut o3 = BufWriter::new(File::create(&p3)?);
-
-        // 简单基于行的 stdin 处理（bufsize 可调）
-        let mut stdin = io::stdin().lock();
-        let mut buf = vec![0u8; opts.bufsize];
-        let mut carry = Vec::<u8>::new();
-
-        loop {
-            let n = stdin.read(&mut buf)?;
-            if n == 0 {
-                if !carry.is_empty() {
-                    let s = String::from_utf8_lossy(&carry);
-                    process_reader(s.as_bytes(), &mut o1, &mut o2, &mut o3, !opts.b58_no_check)?;
-                }
-                break;
-            }
-            carry.extend_from_slice(&buf[..n]);
-            let mut last = 0usize;
-            for (i, b) in carry.iter().enumerate() {
-                if *b == b'\n' {
-                    let chunk = &carry[last..=i];
-                    process_reader(chunk, &mut o1, &mut o2, &mut o3, !opts.b58_no_check)?;
-                    last = i + 1;
-                }
-            }
-            carry = carry.split_off(last);
-        }
-
-        o1.flush()?; o2.flush()?; o3.flush()?;
-        let cnt = |p: &PathBuf| -> io::Result<u64> {
-            Ok(BufReader::new(File::open(p)?).lines().count() as u64)
-        };
-        let c1 = cnt(&p1)?; let c2 = cnt(&p2)?; let c3 = cnt(&p3)?; let skip = 0;
-        println!("[+] {base}  p2pkh={c1} p2sh={c2} p2wpkh={c3} skip={skip}");
-        temp_p2pkh.push(p1);
-        temp_p2sh.push(p2);
-        temp_p2wpkh.push(p3);
-        *total.lock().unwrap() = (c1, c2, c3, skip);
+        // 单路 stdin
+        let p = process_one_file(None, mode, opts.bufsize)?;
+        chunks.push(p);
     } else {
-        // ✅ rayon 并行阶段先收集结果，避免在 Fn 闭包里直接修改外部可变 Vec（修复 E0596）
+        // 以文件并行
         let mut files: Vec<PathBuf> = vec![];
         for pat in opts.inputs.split(',') {
             for entry in glob(pat.trim()).expect("invalid glob") {
@@ -309,54 +386,33 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
 
-        let results: Vec<_> = files.par_iter()
-            .map(|p| process_file(p, &tmpdir, !opts.b58_no_check))
+        let results: Vec<_> = files
+            .par_iter()
+            .map(|p| process_one_file(Some(p), mode, opts.bufsize))
             .collect();
 
         for r in results {
             match r {
-                Ok((base, c1, c2, c3, skip, p1, p2, p3)) => {
-                    println!("[+] {base}  p2pkh={c1} p2sh={c2} p2wpkh={c3} skip={skip}");
-                    {
-                        let mut t = total.lock().unwrap();
-                        t.0 += c1; t.1 += c2; t.2 += c3; t.3 += skip;
-                    }
-                    temp_p2pkh.push(p1);
-                    temp_p2sh.push(p2);
-                    temp_p2wpkh.push(p3);
-                }
-                Err(e) => eprintln!("[-] error: {}", e),
+                Ok(pb) => chunks.push(pb),
+                Err(e) => eprintln!("[-] process error: {e}"),
             }
         }
     }
 
-    let n1 = try_sort_unique(&temp_p2pkh, &out_p2pkh)?;
-    let n2 = try_sort_unique(&temp_p2sh, &out_p2sh)?;
-    let n3 = try_sort_unique(&temp_p2wpkh, &out_p2wpkh)?;
-    let (c1, c2, c3, skip) = *total.lock().unwrap();
+    // 2) k 路归并 -> 输出最终“二进制 + 已排序 + 去重”文件
+    let outp = PathBuf::from(&opts.out);
+    kway_merge_sorted_bins(&chunks, rec_len, &outp)?;
 
-    println!("\n[*] Done.");
-    println!(
-        "    p2pkh (unique): {} -> {}",
-        n1.map(|x| x.to_string()).unwrap_or_else(|| "concat".into()),
-        out_p2pkh.display()
-    );
-    println!(
-        "    p2sh  (unique): {} -> {}",
-        n2.map(|x| x.to_string()).unwrap_or_else(|| "concat".into()),
-        out_p2sh.display()
-    );
-    println!(
-        "    p2wpkh(unique): {} -> {}",
-        n3.map(|x| x.to_string()).unwrap_or_else(|| "concat".into()),
-        out_p2wpkh.display()
-    );
-    println!("    totals (raw): p2pkh={c1} p2sh={c2} p2wpkh={c3} skip={skip}");
-
-    for p in temp_p2pkh.into_iter().chain(temp_p2sh).chain(temp_p2wpkh) {
-        let _ = fs::remove_file(p);
+    // 3) 清理
+    for c in chunks {
+        let _ = fs::remove_file(c);
     }
-    let _ = fs::remove_dir("_tmp_hash160");
+    let _ = fs::remove_dir("_tmp_mkbin");
 
+    eprintln!(
+        "OK -> {} (records: {} bytes each, sorted & unique)",
+        outp.display(),
+        rec_len
+    );
     Ok(())
 }

@@ -1,0 +1,1 @@
+ ./KeyHunt -g --gpui 0 --gpux -1,256 -m ADDRESSES -i data/hash160_bech32_sorted.bin --coin BTC --range 1:FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140 -r 500 -o find.txt

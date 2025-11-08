@@ -226,6 +226,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 
 [[package]]
+name = "mkbin_sorted"
+version = "0.1.0"
+dependencies = [
+ "base58",
+ "bech32",
+ "clap",
+ "glob",
+ "hex",
+ "rayon",
+ "ripemd",
+ "sha2",
+]
+
+[[package]]
 name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -270,17 +284,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "rich160"
-version = "0.1.0"
+name = "ripemd"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd124222d17ad93a644ed9d011a40f4fb64aa54275c08cc216524a9ea82fb09f"
 dependencies = [
- "base58",
- "bech32",
- "clap",
- "glob",
- "hex",
- "rayon",
- "sha2",
- "shell-escape",
+ "digest",
 ]
 
 [[package]]
@@ -293,12 +302,6 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
-
-[[package]]
-name = "shell-escape"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bb67a18fa91266cc7807181f62f9178a6873bfad7dc788c42e6430db40184f"
 
 [[package]]
 name = "strsim"
